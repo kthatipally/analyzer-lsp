@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,9 +84,24 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 		if c.Pattern == "" {
 			return response, fmt.Errorf("could not parse provided regex pattern as string: %v", conditionInfo)
 		}
+
 		var outputBytes []byte
-		grep := exec.Command("grep", "-o", "-n", "-R", "-P", c.Pattern, p.config.Location)
-		outputBytes, err := grep.Output()
+		if runtime.GOOS == "windows" {
+			// Windows does not have grep, so we use PowerShell's Select-String instead
+			// This is a workaround until we can find a better solution
+			psScript := fmt.Sprintf(`
+			$pattern = '%s'
+			Get-ChildItem -Recurse -Path '%s' | Select-String -Pattern $pattern -AllMatches | ForEach-Object { 
+				foreach ($match in $_.Matches) { 
+					"{0}:{1}:{2}" -f $_.Path, $_.LineNumber, $match.Value
+				} 
+			}`, c.Pattern, p.config.Location)
+			findstr := exec.Command("pwsh", "-Command", psScript)
+			outputBytes, err = findstr.Output()
+		} else {
+			grep := exec.Command("grep", "-o", "-n", "-R", "-P", c.Pattern, p.config.Location)
+			outputBytes, err = grep.Output()
+		}
 		if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
 				return response, nil
