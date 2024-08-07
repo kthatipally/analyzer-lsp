@@ -84,56 +84,27 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 		if c.Pattern == "" {
 			return response, fmt.Errorf("could not parse provided regex pattern as string: %v", conditionInfo)
 		}
-		fmt.Println("Keerthi: Pattern", c.Pattern)
 
 		var outputBytes []byte
 		if runtime.GOOS == "windows" {
 			// Windows does not have grep, so we use PowerShell's Select-String instead
 			// This is a workaround until we can find a better solution
-			// psScript := fmt.Sprintf(`
-			// $pattern = '%s'
-			// Get-ChildItem -Recurse -Path '%s' | Select-String -Pattern $pattern -AllMatches | ForEach-Object {
-			// 	foreach ($match in $_.Matches) {
-			// 		"{0}:{1}:{2}" -f $_.Path, $_.LineNumber, $match.Value
-			// 	}
-			// }`, c.Pattern, p.config.Location)
 			psScript := fmt.Sprintf(`
-    $basePath = '%s'
-    $pattern = '%s'
-
-    # Process files in the base directory
-    Get-ChildItem -Path $basePath -File | ForEach-Object {
-        $file = $_    
-        # Search for the pattern in the file
-        Select-String -Path $file.FullName -Pattern $pattern -AllMatches | ForEach-Object { 
-            foreach ($match in $_.Matches) { 
-                "{0}:{1}:{2}" -f $_.Path, $_.LineNumber, $match.Value
-            } 
-        }
-    }
-
-    # Get all subdirectories recursively
-    Get-ChildItem -Recurse -Directory -Path $basePath | ForEach-Object {
-        $directory = $_    
-        # Get all files in the current subdirectory
-        Get-ChildItem -Path $directory.FullName -File | ForEach-Object {
-            $file = $_               
-            # Search for the pattern in the file
-            Select-String -Path $file.FullName -Pattern $pattern -AllMatches | ForEach-Object { 
-                foreach ($match in $_.Matches) { 
-                    "{0}:{1}:{2}" -f $_.Path, $_.LineNumber, $match.Value
-                } 
-            }
-        }
-    }
-`, p.config.Location, c.Pattern)
+			$pattern = '%s'
+			Get-ChildItem -Path '%s' -Recurse -File | ForEach-Object {
+			$file = $_    
+			# Search for the pattern in the file
+			Select-String -Path $file.FullName -Pattern $pattern -AllMatches | ForEach-Object { 
+				foreach ($match in $_.Matches) { 
+					"{0}:{1}:{2}" -f $file.FullName, $_.LineNumber, $match.Value
+					} 
+				}
+			}`, c.Pattern, p.config.Location)
 			findstr := exec.Command("pwsh", "-Command", psScript)
 			outputBytes, err = findstr.Output()
-			fmt.Println("Keerthi: OutputBytes", string(outputBytes), " for windows pattern", c.Pattern)
 		} else {
 			grep := exec.Command("grep", "-o", "-n", "-R", "-P", c.Pattern, p.config.Location)
 			outputBytes, err = grep.Output()
-			fmt.Println("Keerthi: OutputBytes", string(outputBytes), " for linux pattern", c.Pattern)
 		}
 		if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
@@ -152,30 +123,17 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 			var pieces []string
 
 			if runtime.GOOS == "windows" {
-				fmt.Println("Keerthi: in windows for", match)
+				// This will parse the output of the PowerShell Select-String command file path:line number:matching text -
 				re, err := regexp.Compile(`^(.*?):(\d+):(.*)$`)
-				fmt.Println("Keerthi: in windows for after the compile", match)
 				if err != nil {
 					return response, fmt.Errorf("failed to compile regular expression: %v", err)
 				}
-				fmt.Println("Keerthi: in windows for before the submatch", match)
 				submatches := re.FindStringSubmatch(match)
-				fmt.Println("Keerthi: in windows for after the submatch", match)
 				if len(submatches) != 4 {
 					return response, fmt.Errorf(
 						"malformed response from powershell, cannot parse grep output '%s' with pattern {filepath}:{lineNumber}:{matchingText}", match)
 				}
-				fmt.Println("Keerthi: in windows for after the len comparision", match)
-
-				// pieces = append(pieces, "")
-				pieces = make([]string, 3) // Creates a slice of length 3 with all elements initialized to zero
-
-				pieces[0] = submatches[1]
-				// fmt.Println("Keerthi: in windows for after the pieces 0", match)
-				pieces[1] = submatches[2]
-				pieces[2] = submatches[3]
-				fmt.Println("Keerthi: Pieces", submatches[1])
-
+				pieces = submatches[1:4]
 			} else {
 				//TODO(fabianvf): This will not work if there is a `:` in the filename, do we care?
 				pieces = strings.SplitN(match, ":", 3)
@@ -186,7 +144,7 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 						"malformed response from grep, cannot parse grep output '%s' with pattern {filepath}:{lineNumber}:{matchingText}", match)
 				}
 			}
-			fmt.Println("Keerthi: after if else", c.FilePattern)
+
 			containsFile, err := provider.FilterFilePattern(c.FilePattern, pieces[0])
 			if err != nil {
 				return response, err
@@ -194,7 +152,6 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 			if !containsFile {
 				continue
 			}
-			fmt.Println("Keerthi: after containsFile")
 
 			absPath, err := filepath.Abs(pieces[0])
 			if err != nil {
@@ -209,9 +166,6 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 			if err != nil {
 				return response, fmt.Errorf("cannot convert line number string to integer")
 			}
-			fmt.Println("Keerthi: for pieces[0]", pieces[0])
-			fmt.Println("Keerthi: lineNumber", lineNumber)
-			fmt.Println("Keerthi: absPath", absPath)
 
 			response.Incidents = append(response.Incidents, provider.IncidentContext{
 				FileURI:    uri.File(absPath),
@@ -228,7 +182,6 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 		if len(response.Incidents) != 0 {
 			response.Matched = true
 		}
-		fmt.Println("Keerthi: Response", response.Matched)
 		return response, nil
 	case "xml":
 		query, err := xpath.CompileWithNS(cond.XML.XPath, cond.XML.Namespaces)
