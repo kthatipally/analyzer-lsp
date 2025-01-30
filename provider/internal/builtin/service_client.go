@@ -262,7 +262,7 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 		for _, file := range xmlFiles {
 			nodes, err := queryXMLFile(file, query)
 			if err != nil {
-				log.Error(err, "failed to query xml file", "file", file)
+				log.Error(err, "Keerthi failed to query xml file", "file", file)
 				continue
 			}
 
@@ -557,6 +557,7 @@ type walkResult struct {
 }
 
 func parallelWalk(location string, regex *regexp2.Regexp) ([]walkResult, error) {
+
 	var positions []walkResult
 	var positionsMu sync.Mutex
 	var eg errgroup.Group
