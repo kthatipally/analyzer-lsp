@@ -184,7 +184,7 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 		for _, file := range xmlFiles {
 			nodes, err := queryXMLFile(file, query)
 			if err != nil {
-				log.V(5).Error(err, "failed to query xml file", "file", file)
+				log.V(5).Error(err, "Keerthi failed to query xml file", "file", file)
 				continue
 			}
 			if len(nodes) != 0 {
