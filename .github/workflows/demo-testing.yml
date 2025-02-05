@@ -83,6 +83,11 @@ jobs:
             run-external-providers-pod
           podman build -f demo-local.Dockerfile -t localhost/testing:latest
           make run-demo-image
+
+      - name: cat demo-output.yaml
+        run: cat demo-dep-output.yaml
+      - name: git show HEAD:demo-output.yaml
+        run: git show HEAD:demo-output.yaml
       
       - name: install yq for testing
         run: go install github.com/mikefarah/yq/v4@latest
