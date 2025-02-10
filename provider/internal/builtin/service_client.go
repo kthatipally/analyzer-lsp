@@ -8,14 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/antchfx/jsonquery"
 	"github.com/antchfx/xmlquery"
 	"github.com/antchfx/xpath"
-	"github.com/dlclark/regexp2"
 	"github.com/go-logr/logr"
 	"github.com/konveyor/analyzer-lsp/lsp/protocol"
 	"github.com/konveyor/analyzer-lsp/provider"
@@ -61,11 +59,11 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 		}
 		matchingFiles := []string{}
 		if ok, paths := cond.ProviderContext.GetScopedFilepaths(); ok {
-			regex, _ := regexp.Compile(c.Pattern)
+			regex, _ := compileRegex(c.Pattern)
 			for _, path := range paths {
 				matched := false
 				if regex != nil {
-					matched = regex.MatchString(path)
+					matched, _ = regex.MatchString(path)
 				} else {
 					// TODO(fabianvf): is a fileglob style pattern sufficient or do we need regexes?
 					matched, err = filepath.Match(c.Pattern, path)
@@ -78,7 +76,7 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 				}
 			}
 		} else {
-			matchingFiles, err = findFilesMatchingPattern(p.config.Location, c.Pattern)
+			matchingFiles, err = p.findFilesMatchingPattern(p.config.Location, c.Pattern)
 			if err != nil {
 				return response, fmt.Errorf("unable to find files using pattern `%s`: %v", c.Pattern, err)
 			}
@@ -109,22 +107,17 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 			return response, fmt.Errorf("could not parse provided regex pattern as string: %v", conditionInfo)
 		}
 
-		patternRegex, err := regexp2.Compile(c.Pattern, regexp2.None)
+		patternRegex, err := compileRegex(c.Pattern)
 		if err != nil {
 			return response, fmt.Errorf("could not compile provided regex pattern '%s': %v", c.Pattern, err)
 		}
-
-		matches, err := parallelWalk(p.config.Location, patternRegex)
+		hasScopedPaths, scopedPaths := cond.ProviderContext.GetScopedFilepaths()
+		matches, err := parallelWalk(p.config.Location, patternRegex, hasScopedPaths, scopedPaths)
 		if err != nil {
 			return response, err
 		}
 
 		for _, match := range matches {
-			var pieces []string
-			pieces, err := parseGrepOutputForFileContent(match.match)
-			if err != nil {
-				return response, fmt.Errorf("could not parse grep output '%v' for the Pattern '%v': %v ", match, c.Pattern, err)
-			}
 			containsFile, err := provider.FilterFilePattern(c.FilePattern, match.positionParams.TextDocument.URI)
 			if err != nil {
 				return response, err
@@ -132,24 +125,16 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 			if !containsFile {
 				continue
 			}
+			fileURI := uri.URI(match.positionParams.TextDocument.URI)
 			lineNumber := int(match.positionParams.Position.Line)
 
-			if !containsFile {
-				continue
-			}
-
-			absPath, err := filepath.Abs(pieces[0])
+			absPath, err := filepath.Abs(fileURI.Filename())
 			if err != nil {
-				absPath = pieces[0]
+				absPath = fileURI.Filename()
 			}
 
 			if !p.isFileIncluded(absPath) {
 				continue
-			}
-
-			lineNumber, err := strconv.Atoi(pieces[1])
-			if err != nil {
-				return response, fmt.Errorf("cannot convert line number string to integer")
 			}
 
 			response.Incidents = append(response.Incidents, provider.IncidentContext{
@@ -246,7 +231,7 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 
 		return response, nil
 	case "xmlPublicID":
-		regex, err := regexp.Compile(cond.XMLPublicID.Regex)
+		regex, err := compileRegex(cond.XMLPublicID.Regex)
 		if err != nil {
 			return response, fmt.Errorf("could not parse provided public-id regex '%s': %v", cond.XMLPublicID.Regex, err)
 		}
@@ -294,7 +279,7 @@ func (p *builtinServiceClient) Evaluate(ctx context.Context, cap string, conditi
 				// public-id attribute regex match check
 				for _, attr := range node.Attr {
 					if attr.Name.Local == "public-id" {
-						if regex.MatchString(attr.Value) {
+						if ok, _ := regex.MatchString(attr.Value); ok {
 							response.Matched = true
 							absPath, err := filepath.Abs(file)
 							if err != nil {
@@ -467,18 +452,20 @@ func (b *builtinServiceClient) getLocation(ctx context.Context, path, content st
 	return location, nil
 }
 
-func findFilesMatchingPattern(root, pattern string) ([]string, error) {
-	var regex *regexp.Regexp
+func (p *builtinServiceClient) findFilesMatchingPattern(root, pattern string) ([]string, error) {
 	// if the regex doesn't compile, we'll default to using filepath.Match on the pattern directly
-	regex, _ = regexp.Compile(pattern)
+	regex, regexError := compileRegex(pattern)
+	if regexError != nil {
+		p.log.Error(regexError, "failed to compile regex", "pattern", pattern, "regex", regex)
+	}
 	matches := []string{}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		var matched bool
-		if regex != nil {
-			matched = regex.MatchString(d.Name())
+		if regex != nil && regexError == nil {
+			matched, _ = regex.MatchString(d.Name())
 		} else {
 			// TODO(fabianvf): is a fileglob style pattern sufficient or do we need regexes?
 			matched, err = filepath.Match(pattern, d.Name())
@@ -580,7 +567,7 @@ type walkResult struct {
 	match          string
 }
 
-func parallelWalk(location string, regex *regexp2.Regexp) ([]walkResult, error) {
+func parallelWalk(location string, regex *regexSelector, hasScopedPaths bool, includedPaths []string) ([]walkResult, error) {
 	var positions []walkResult
 	var positionsMu sync.Mutex
 	var eg errgroup.Group
@@ -595,6 +582,17 @@ func parallelWalk(location string, regex *regexp2.Regexp) ([]walkResult, error) 
 		}
 
 		if f.Mode().IsRegular() {
+			if hasScopedPaths {
+				found := true
+				for _, path := range includedPaths {
+					if path == filepath.Join(f.Name()) {
+						found = true
+					}
+				}
+				if !found {
+					return nil
+				}
+			}
 			eg.Go(func() error {
 				pos, err := processFile(path, regex)
 				if err != nil {
@@ -621,7 +619,7 @@ func parallelWalk(location string, regex *regexp2.Regexp) ([]walkResult, error) 
 	return positions, nil
 }
 
-func processFile(path string, regex *regexp2.Regexp) ([]walkResult, error) {
+func processFile(path string, regex *regexSelector) ([]walkResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -634,43 +632,37 @@ func processFile(path string, regex *regexp2.Regexp) ([]walkResult, error) {
 	lineNumber := 1
 	for scanner.Scan() {
 		line := scanner.Text()
-		match, err := regex.FindStringMatch(line)
+		match, index, err := regex.FindStringMatch(line)
 		if err != nil {
 			return nil, err
 		}
-		for match != nil {
-			absPath, err := filepath.Abs(path)
-			if err != nil {
-				return nil, err
-			}
-
-			r = append(r, walkResult{
-				positionParams: protocol.TextDocumentPositionParams{
-					TextDocument: protocol.TextDocumentIdentifier{
-						URI: fmt.Sprintf("file:///%s", filepath.ToSlash(absPath)),
-					},
-					Position: protocol.Position{
-						Line:      uint32(lineNumber),
-						Character: uint32(match.Index),
-					},
-				},
-				match: match.String(),
-			})
-			match, err = regex.FindNextMatch(match)
-			if err != nil {
-				return nil, err
-			}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
 		}
+
+		r = append(r, walkResult{
+			positionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{
+					URI: fmt.Sprintf("file:///%s", filepath.ToSlash(absPath)),
+				},
+				Position: protocol.Position{
+					Line:      uint32(lineNumber),
+					Character: uint32(index),
+				},
+			},
+			match: match,
+		})
 		lineNumber++
 	}
-
 	return r, nil
 }
+
 func parseGrepOutputForFileContent(match string) ([]string, error) {
 	// This will parse the output of the PowerShell/grep in the form
 	// "Filepath:Linenumber:Matchingtext" to return string array of path, line number and matching text
 	// works with handling both windows and unix based file paths eg: "C:\path\to\file" and "/path/to/file"
-	re, err := regexp.Compile(`^(.*?):(\d+):(.*)$`)
+	re, err := compileRegex(`^(.*?):(\d+):(.*)$`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile regular expression: %v", err)
 	}
